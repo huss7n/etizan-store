@@ -1,18 +1,11 @@
-import { createClient } from '@supabase/supabase-js';
-import { triggerRestore } from './_wake.js';
+const { createClient } = require('@supabase/supabase-js');
 
-const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY,
-  {
-    global: {
-      fetch: async (url, options) => {
-        const res = await fetch(url, options);
-        if (!res.ok && res.status >= 500) triggerRestore();
-        return res;
-      },
-    },
-  }
-);
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || 
+                   'https://ziafttjpcljhkqnwnetg.supabase.co';
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || 
+                   'sb_secret_0emttB5ThKbrwL8knTFB9Q_uqYY_0Xn';
 
-export default supabase;
+const supabase = createClient(supabaseUrl, supabaseKey);
+
+module.exports = supabase;
+module.exports.default = supabase;
