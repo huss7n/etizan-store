@@ -1,10 +1,17 @@
 import { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { ShoppingBag, Search, X, Check, Upload, Eye, Edit, Trash2, LogOut, Settings, Package, CreditCard, Download, Clock, CheckCircle2, XCircle, Menu, Home, BookOpen, Video, LayoutGrid } from 'lucide-react';
-import supabase from './lib/supabase';
+import { supabase } from './lib/supabase';
 import { handleGoogleRedirect, signInWithGoogle } from './lib/googleAuth';
+import { initAnalytics, metaPixel, ga } from './lib/analytics';
+import { saveCheckoutData, getCheckoutData, clearCheckoutData, saveCheckoutStep, getCheckoutStep } from './lib/localStorage';
+import WhatsAppButton from './components/WhatsAppButton';
+import RelatedProducts from './components/RelatedProducts';
 
 handleGoogleRedirect();
+
+// Initialize analytics on app load
+initAnalytics();
 
 type Product = {
   id: number;
@@ -81,7 +88,7 @@ function App() {
     initAuth();
 
     // Listen for auth changes
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event: any, session: any) => {
       if (mounted) {
         setUser(session?.user ?? null);
       }
@@ -92,6 +99,18 @@ function App() {
       subscription.unsubscribe();
     };
   }, []);
+
+  // Track page views for analytics
+  useEffect(() => {
+    // Track page view
+    metaPixel.pageView();
+    ga.pageView(view === 'store' ? '/' : `/${view}`);
+    
+    // Track specific events based on view
+    if (view === 'store') {
+      ga.event('view_store', { category: 'navigation' });
+    }
+  }, [view]);
 
   // Show loading until auth is checked
   if (!authChecked) {
@@ -499,6 +518,23 @@ function Storefront({ onAdminAccess }: { onAdminAccess: () => void }) {
                       <span>دعم فني خلال 24 ساعة</span>
                     </div>
                   </div>
+                  
+                  {/* Related Products */}
+                  <RelatedProducts 
+                    currentProductId={selectedProduct.id}
+                    category={selectedProduct.category}
+                    onProductClick={(relatedProduct) => {
+                      // Fetch full product details before setting
+                      fetch(`/api/products?id=${relatedProduct.id}`)
+                        .then(r => r.json())
+                        .then((fullProduct: Product) => {
+                          setSelectedProduct(fullProduct);
+                          // Scroll to top of modal
+                          const modal = document.querySelector('[class*="max-h-[90vh]"]');
+                          if (modal) modal.scrollTop = 0;
+                        });
+                    }}
+                  />
                 </div>
               </div>
             </motion.div>
@@ -518,6 +554,13 @@ function Storefront({ onAdminAccess }: { onAdminAccess: () => void }) {
         )}
       </AnimatePresence>
 
+      {/* WhatsApp Floating Button */}
+      <WhatsAppButton 
+        phoneNumber={settings.support_phone || settings.zain_cash_number}
+        message="السلام عليكم، أحتاج إلى المساعدة في متجر إتزان"
+        position="bottom-left"
+      />
+
       {/* Footer */}
       <footer className="border-t border-white/5 py-8">
         <div className="max-w-[1400px] mx-auto px-4 sm:px-6 lg:px-8">
@@ -533,16 +576,22 @@ function Storefront({ onAdminAccess }: { onAdminAccess: () => void }) {
 
 // Checkout Modal Component
 function CheckoutModal({ product, settings, onClose, onSuccess }: { product: Product; settings: SettingsType; onClose: () => void; onSuccess: () => void }) {
-  const [step, setStep] = useState(1);
+  // Try to restore saved checkout data
+  const savedData = getCheckoutData();
+  const savedStep = getCheckoutStep();
+  const isValidSavedData = savedData && savedData.productId === product.id.toString();
+  
+  const [step, setStep] = useState(isValidSavedData ? savedStep : 1);
   const [formData, setFormData] = useState({
-    name: '',
-    email: '',
-    phone: '',
-    payment_method: 'zain_cash',
+    name: isValidSavedData ? savedData.customerName || '' : '',
+    email: isValidSavedData ? savedData.customerEmail || '' : '',
+    phone: isValidSavedData ? savedData.customerPhone || '' : '',
+    payment_method: isValidSavedData ? savedData.paymentMethod || 'zain_cash' : 'zain_cash',
   });
   const [receiptFile, setReceiptFile] = useState<File | null>(null);
   const [uploading, setUploading] = useState(false);
   const [orderNumber, setOrderNumber] = useState('');
+  const [showRestoreNotice, setShowRestoreNotice] = useState(isValidSavedData && savedStep > 1);
 
   const discountedPrice = product.price * (1 - product.discount_percent / 100);
   const formatPrice = (price: number) => new Intl.NumberFormat('ar-IQ').format(price) + ' د.ع';
@@ -554,6 +603,35 @@ function CheckoutModal({ product, settings, onClose, onSuccess }: { product: Pro
   ];
 
   const selectedMethod = paymentMethods.find(m => m.id === formData.payment_method)!;
+
+  // Save checkout data when form changes
+  useEffect(() => {
+    saveCheckoutData({
+      productId: product.id.toString(),
+      productName: product.title,
+      productPrice: discountedPrice,
+      productImage: product.cover_image,
+      customerName: formData.name,
+      customerPhone: formData.phone,
+      customerEmail: formData.email,
+      paymentMethod: formData.payment_method,
+    });
+  }, [formData, product, discountedPrice]);
+
+  // Save step when changed
+  useEffect(() => {
+    saveCheckoutStep(step);
+  }, [step]);
+
+  // Clear saved data on successful order
+  const clearSavedData = () => {
+    clearCheckoutData();
+  };
+
+  const handleStepChange = (newStep: number) => {
+    setStep(newStep);
+    saveCheckoutStep(newStep);
+  };
 
   const handleSubmit = async () => {
     if (!receiptFile) return;
@@ -578,6 +656,31 @@ function CheckoutModal({ product, settings, onClose, onSuccess }: { product: Pro
       
       const order = await res.json();
       setOrderNumber(order.order_number);
+      
+      // Clear saved data on success
+      clearSavedData();
+      
+      // Track purchase
+      metaPixel.purchase({
+        content_ids: [product.id.toString()],
+        content_type: 'product',
+        value: discountedPrice,
+        currency: 'IQD',
+        order_id: order.order_number
+      });
+      
+      ga.purchase({
+        transaction_id: order.order_number,
+        value: discountedPrice,
+        currency: 'IQD',
+        items: [{
+          id: product.id.toString(),
+          name: product.title,
+          price: discountedPrice,
+          quantity: 1
+        }]
+      });
+      
       setStep(3);
     } catch (err) {
       console.error(err);
@@ -610,6 +713,25 @@ function CheckoutModal({ product, settings, onClose, onSuccess }: { product: Pro
           <button onClick={onClose} className="absolute top-5 left-5 w-8 h-8 flex items-center justify-center hover:bg-white/5 rounded-lg transition-colors">
             <X className="w-4 h-4 text-white/60" />
           </button>
+
+          {/* Data Restore Notice */}
+          {showRestoreNotice && (
+            <motion.div 
+              initial={{ opacity: 0, y: -10 }}
+              animate={{ opacity: 1, y: 0 }}
+              className="mb-4 p-3 bg-emerald-500/10 border border-emerald-500/20 rounded-xl"
+            >
+              <p className="text-[12px] text-emerald-300 text-center">
+                تم استعادة بياناتك السابقة للاستمرار في الدفع
+              </p>
+              <button 
+                onClick={() => setShowRestoreNotice(false)}
+                className="w-full mt-2 text-[11px] text-emerald-400 hover:text-emerald-300"
+              >
+                إغلاق
+              </button>
+            </motion.div>
+          )}
 
           {step === 1 && (
             <div>
@@ -662,7 +784,21 @@ function CheckoutModal({ product, settings, onClose, onSuccess }: { product: Pro
               </div>
 
               <button
-                onClick={() => setStep(2)}
+                onClick={() => {
+                  handleStepChange(2);
+                  // Track initiate checkout
+                  metaPixel.initiateCheckout({
+                    content_ids: [product.id.toString()],
+                    value: discountedPrice,
+                    currency: 'IQD'
+                  });
+                  ga.beginCheckout([{
+                    id: product.id.toString(),
+                    name: product.title,
+                    price: discountedPrice,
+                    quantity: 1
+                  }], discountedPrice);
+                }}
                 disabled={!formData.name || !formData.email || !formData.phone}
                 className="w-full h-12 mt-6 bg-white text-black font-bold rounded-xl hover:bg-white/90 disabled:opacity-30 disabled:cursor-not-allowed transition-all active:scale-[0.98]"
               >
@@ -673,7 +809,7 @@ function CheckoutModal({ product, settings, onClose, onSuccess }: { product: Pro
 
           {step === 2 && (
             <div>
-              <button onClick={() => setStep(1)} className="text-[13px] text-white/60 hover:text-white mb-4 flex items-center gap-1">
+              <button onClick={() => handleStepChange(1)} className="text-[13px] text-white/60 hover:text-white mb-4 flex items-center gap-1">
                 ← رجوع
               </button>
 
@@ -922,14 +1058,6 @@ function AdminLogin({ onBack }: { onBack: () => void }) {
             </svg>
             الدخول عبر Google
           </button>
-
-          <div className="mt-6 p-3 bg-emerald-500/5 border border-emerald-500/10 rounded-xl">
-            <p className="text-[11px] text-emerald-200/70 text-center leading-relaxed">
-              <strong>بيانات الدخول:</strong><br />
-              admin@etizan.com<br />
-              Hussin7788$$
-            </p>
-          </div>
         </div>
       </div>
     </div>
@@ -938,7 +1066,11 @@ function AdminLogin({ onBack }: { onBack: () => void }) {
 
 // Admin Dashboard
 function AdminDashboard({ user, onLogout, onBack }: { user: any; onLogout: () => void; onBack: () => void }) {
-  const [activeTab, setActiveTab] = useState<'orders' | 'products' | 'settings'>('orders');
+  const [activeTab, setActiveTab] = useState<'orders' | 'products' | 'settings' | 'admins' | 'profile'>('orders');
+  const [adminPermissions, setAdminPermissions] = useState<any>(null);
+  const [showChangePassword, setShowChangePassword] = useState(false);
+  const [admins, setAdmins] = useState<any[]>([]);
+  const [showAddAdmin, setShowAddAdmin] = useState(false);
   const [orders, setOrders] = useState<Order[]>([]);
   const [products, setProducts] = useState<Product[]>([]);
   const [settings, setSettings] = useState<SettingsType>({});
@@ -949,7 +1081,43 @@ function AdminDashboard({ user, onLogout, onBack }: { user: any; onLogout: () =>
     fetchOrders();
     fetchProducts();
     fetchSettings();
+    checkAdminPermissions();
+    fetchAdmins();
   }, []);
+
+  const checkAdminPermissions = async () => {
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session) return;
+    
+    try {
+      const res = await fetch('/api/check-admin', {
+        headers: { 'Authorization': `Bearer ${session.access_token}` }
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setAdminPermissions(data.permissions);
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const fetchAdmins = async () => {
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session) return;
+    
+    try {
+      const res = await fetch('/api/admins', {
+        headers: { 'Authorization': `Bearer ${session.access_token}` }
+      });
+      const data = await res.json();
+      if (Array.isArray(data)) {
+        setAdmins(data);
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  };
 
   const fetchOrders = async () => {
     try {
@@ -1053,6 +1221,8 @@ function AdminDashboard({ user, onLogout, onBack }: { user: any; onLogout: () =>
                   { id: 'orders', label: 'الطلبات', icon: CreditCard, count: pendingOrders },
                   { id: 'products', label: 'المنتجات', icon: Package, count: products.length },
                   { id: 'settings', label: 'الإعدادات', icon: Settings, count: 0 },
+                  ...(adminPermissions?.canManageAdmins ? [{ id: 'admins', label: 'المشرفين', icon: LogOut, count: 0 }] : []),
+                  { id: 'profile', label: 'الملف الشخصي', icon: Settings, count: 0 },
                 ].map(tab => (
                   <button
                     key={tab.id}
@@ -1118,6 +1288,8 @@ function AdminDashboard({ user, onLogout, onBack }: { user: any; onLogout: () =>
             { id: 'orders', label: 'الطلبات', icon: CreditCard },
             { id: 'products', label: 'المنتجات', icon: Package },
             { id: 'settings', label: 'الإعدادات', icon: Settings },
+            ...(adminPermissions?.canManageAdmins ? [{ id: 'admins', label: 'المشرفين', icon: LogOut }] : []),
+            { id: 'profile', label: 'الملف', icon: Settings },
           ].map(tab => (
             <button
               key={tab.id}
@@ -1300,7 +1472,145 @@ function AdminDashboard({ user, onLogout, onBack }: { user: any; onLogout: () =>
             </div>
           </div>
         )}
+
+        {activeTab === 'admins' && adminPermissions?.canManageAdmins && (
+          <div>
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-[16px] font-bold">إدارة المشرفين</h2>
+              <button onClick={() => setShowAddAdmin(true)} className="h-9 px-4 bg-white text-black text-[13px] font-bold rounded-xl hover:bg-white/90 transition-all flex items-center gap-1.5">
+                <Settings className="w-3.5 h-3.5" />
+                إضافة مشرف
+              </button>
+            </div>
+            
+            <div className="bg-[#0f172a]/50 backdrop-blur-sm border border-white/[0.07] rounded-[24px] overflow-hidden">
+              <table className="w-full text-[13px]">
+                <thead>
+                  <tr className="border-b border-white/5 text-white/50">
+                    <th className="text-right py-3 px-4 font-medium">المشرف</th>
+                    <th className="text-right py-3 px-4 font-medium">البريد</th>
+                    <th className="text-right py-3 px-4 font-medium">الصلاحية</th>
+                    <th className="text-right py-3 px-4 font-medium">الحالة</th>
+                    <th className="text-right py-3 px-4 font-medium">الإجراءات</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {admins.map((admin) => (
+                    <tr key={admin.id} className="border-b border-white/5 last:border-0 hover:bg-white/[0.02]">
+                      <td className="py-3 px-4">
+                        <div className="font-medium">{admin.full_name || '-'}</div>
+                      </td>
+                      <td className="py-3 px-4 text-white/60">{admin.email}</td>
+                      <td className="py-3 px-4">
+                        <span className={`px-2 py-0.5 rounded-md text-[11px] font-medium ${
+                          admin.role === 'super_admin' ? 'bg-purple-500/15 text-purple-400' : 'bg-blue-500/15 text-blue-400'
+                        }`}>
+                          {admin.role === 'super_admin' ? 'مدير عام' : 'مشرف'}
+                        </span>
+                      </td>
+                      <td className="py-3 px-4">
+                        <span className={`px-2 py-0.5 rounded-md text-[11px] font-medium ${
+                          admin.is_active ? 'bg-emerald-500/15 text-emerald-400' : 'bg-red-500/15 text-red-400'
+                        }`}>
+                          {admin.is_active ? 'نشط' : 'معطل'}
+                        </span>
+                      </td>
+                      <td className="py-3 px-4">
+                        {admin.role !== 'super_admin' && (
+                          <button 
+                            onClick={async () => {
+                              if (!confirm('هل أنت متأكد من حذف هذا المشرف؟')) return;
+                              const { data: { session } } = await supabase.auth.getSession();
+                              await fetch('/api/admins', {
+                                method: 'DELETE',
+                                headers: { 
+                                  'Content-Type': 'application/json',
+                                  'Authorization': `Bearer ${session?.access_token}`
+                                },
+                                body: JSON.stringify({ id: admin.id })
+                              });
+                              fetchAdmins();
+                            }}
+                            className="w-7 h-7 flex items-center justify-center bg-red-500/15 hover:bg-red-500/25 text-red-400 rounded-lg transition-colors"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              {admins.length === 0 && (
+                <div className="py-16 text-center text-white/40 text-[14px]">لا يوجد مشرفين</div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {activeTab === 'profile' && (
+          <div className="max-w-xl">
+            <div className="bg-[#0f172a]/50 backdrop-blur-sm border border-white/[0.07] rounded-[24px] p-6">
+              <h2 className="text-[16px] font-bold mb-6">الملف الشخصي</h2>
+              
+              <div className="space-y-4 mb-6">
+                <div>
+                  <label className="block text-[12px] font-medium text-white/70 mb-1.5">البريد الإلكتروني</label>
+                  <input
+                    type="email"
+                    value={user.email}
+                    disabled
+                    className="w-full h-11 px-3.5 bg-white/[0.03] border border-white/10 rounded-xl text-[14px] text-white/50 cursor-not-allowed"
+                    dir="ltr"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[12px] font-medium text-white/70 mb-1.5">الصلاحية</label>
+                  <input
+                    type="text"
+                    value={adminPermissions?.role === 'super_admin' ? 'مدير عام' : 'مشرف'}
+                    disabled
+                    className="w-full h-11 px-3.5 bg-white/[0.03] border border-white/10 rounded-xl text-[14px] text-white/50 cursor-not-allowed"
+                  />
+                </div>
+              </div>
+
+              <div className="border-t border-white/5 pt-6">
+                <h3 className="text-[14px] font-bold mb-4">تغيير كلمة المرور</h3>
+                
+                {!showChangePassword ? (
+                  <button 
+                    onClick={() => setShowChangePassword(true)}
+                    className="h-10 px-5 bg-white/5 hover:bg-white/10 border border-white/10 text-white text-[13px] font-medium rounded-xl transition-all"
+                  >
+                    تغيير كلمة المرور
+                  </button>
+                ) : (
+                  <ChangePasswordForm 
+                    onCancel={() => setShowChangePassword(false)}
+                    onSuccess={() => {
+                      setShowChangePassword(false);
+                      alert('تم تغيير كلمة المرور بنجاح');
+                    }}
+                  />
+                )}
+              </div>
+            </div>
+          </div>
+        )}
       </main>
+
+      <AnimatePresence>
+        {showAddAdmin && (
+          <AddAdminModal 
+            onClose={() => setShowAddAdmin(false)}
+            onSuccess={() => {
+              setShowAddAdmin(false);
+              fetchAdmins();
+            }}
+          />
+        )}
+      </AnimatePresence>
 
       <AnimatePresence>
         {showProductModal && (
@@ -1312,6 +1622,259 @@ function AdminDashboard({ user, onLogout, onBack }: { user: any; onLogout: () =>
         )}
       </AnimatePresence>
     </div>
+  );
+}
+
+// Change Password Form Component
+function ChangePasswordForm({ onCancel, onSuccess }: { onCancel: () => void; onSuccess: () => void }) {
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLoading(true);
+    setError('');
+
+    if (newPassword !== confirmPassword) {
+      setError('كلمتا المرور الجديدة غير متطابقتين');
+      setLoading(false);
+      return;
+    }
+
+    if (newPassword.length < 8) {
+      setError('كلمة المرور جديدة يجب أن تكون ٨ أحرف على الأقل');
+      setLoading(false);
+      return;
+    }
+
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+      const res = await fetch('/api/admin/change-password', {
+        method: 'POST',
+        headers: { 
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${session?.access_token}`
+        },
+        body: JSON.stringify({ currentPassword, newPassword })
+      });
+
+      const data = await res.json();
+      
+      if (res.ok) {
+        onSuccess();
+      } else {
+        setError(data.error || 'فشل في تغيير كلمة المرور');
+      }
+    } catch (e) {
+      setError('حدث خطأ غير متوقع');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <form onSubmit={handleSubmit} className="space-y-3">
+      {error && (
+        <div className="p-3 bg-red-500/10 border border-red-500/20 rounded-xl text-[12px] text-red-400">
+          {error}
+        </div>
+      )}
+      <div>
+        <label className="block text-[12px] font-medium text-white/70 mb-1.5">كلمة المرور الحالية</label>
+        <input
+          type="password"
+          value={currentPassword}
+          onChange={(e) => setCurrentPassword(e.target.value)}
+          className="w-full h-10 px-3 bg-white/[0.03] border border-white/10 rounded-xl text-[14px] focus:outline-none focus:border-emerald-500/50"
+          required
+        />
+      </div>
+      <div>
+        <label className="block text-[12px] font-medium text-white/70 mb-1.5">كلمة المرور الجديدة</label>
+        <input
+          type="password"
+          value={newPassword}
+          onChange={(e) => setNewPassword(e.target.value)}
+          className="w-full h-10 px-3 bg-white/[0.03] border border-white/10 rounded-xl text-[14px] focus:outline-none focus:border-emerald-500/50"
+          required
+        />
+      </div>
+      <div>
+        <label className="block text-[12px] font-medium text-white/70 mb-1.5">تأكيد كلمة المرور</label>
+        <input
+          type="password"
+          value={confirmPassword}
+          onChange={(e) => setConfirmPassword(e.target.value)}
+          className="w-full h-10 px-3 bg-white/[0.03] border border-white/10 rounded-xl text-[14px] focus:outline-none focus:border-emerald-500/50"
+          required
+        />
+      </div>
+      <div className="flex gap-2 pt-2">
+        <button
+          type="button"
+          onClick={onCancel}
+          className="flex-1 h-10 bg-white/5 hover:bg-white/10 text-white text-[13px] font-medium rounded-xl transition-all"
+        >
+          إلغاء
+        </button>
+        <button
+          type="submit"
+          disabled={loading}
+          className="flex-1 h-10 bg-emerald-500 text-black text-[13px] font-bold rounded-xl hover:bg-emerald-400 transition-all disabled:opacity-50"
+        >
+          {loading ? 'جارٍ...' : 'حفظ'}
+        </button>
+      </div>
+    </form>
+  );
+}
+
+// Add Admin Modal Component
+function AddAdminModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: () => void }) {
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [fullName, setFullName] = useState('');
+  const [role, setRole] = useState('moderator');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLoading(true);
+    setError('');
+
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+      const res = await fetch('/api/admins', {
+        method: 'POST',
+        headers: { 
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${session?.access_token}`
+        },
+        body: JSON.stringify({ email, password, full_name: fullName, role })
+      });
+
+      const data = await res.json();
+      
+      if (res.ok) {
+        onSuccess();
+      } else {
+        setError(data.error || 'فشل في إضافة المشرف');
+      }
+    } catch (e) {
+      setError('حدث خطأ غير متوقع');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <motion.div 
+      initial={{ opacity: 0 }} 
+      animate={{ opacity: 1 }} 
+      exit={{ opacity: 0 }} 
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-xl"
+      onClick={onClose}
+    >
+      <motion.div 
+        initial={{ scale: 0.95 }} 
+        animate={{ scale: 1 }} 
+        exit={{ scale: 0.95 }} 
+        onClick={(e) => e.stopPropagation()} 
+        className="w-full max-w-[480px] bg-[#0f172a] border border-white/10 rounded-[24px] shadow-2xl p-6"
+      >
+        <div className="flex items-center justify-between mb-6">
+          <h3 className="text-[18px] font-bold">إضافة مشرف جديد</h3>
+          <button onClick={onClose} className="w-8 h-8 flex items-center justify-center hover:bg-white/5 rounded-lg transition-colors">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+
+        {error && (
+          <div className="mb-4 p-3 bg-red-500/10 border border-red-500/20 rounded-xl text-[12px] text-red-400">
+            {error}
+          </div>
+        )}
+
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <div>
+            <label className="block text-[12px] font-medium text-white/70 mb-1.5">الاسم الكامل</label>
+            <input
+              type="text"
+              value={fullName}
+              onChange={(e) => setFullName(e.target.value)}
+              className="w-full h-11 px-3.5 bg-white/[0.03] border border-white/10 rounded-xl text-[14px] focus:outline-none focus:border-emerald-500/50"
+              placeholder="مثال: أحمد محمد"
+              required
+            />
+          </div>
+          <div>
+            <label className="block text-[12px] font-medium text-white/70 mb-1.5">البريد الإلكتروني</label>
+            <input
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              className="w-full h-11 px-3.5 bg-white/[0.03] border border-white/10 rounded-xl text-[14px] focus:outline-none focus:border-emerald-500/50"
+              placeholder="example@mail.com"
+              dir="ltr"
+              required
+            />
+          </div>
+          <div>
+            <label className="block text-[12px] font-medium text-white/70 mb-1.5">كلمة المرور</label>
+            <input
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              className="w-full h-11 px-3.5 bg-white/[0.03] border border-white/10 rounded-xl text-[14px] focus:outline-none focus:border-emerald-500/50"
+              placeholder="٨ أحرف على الأقل"
+              dir="ltr"
+              required
+              minLength={8}
+            />
+          </div>
+          <div>
+            <label className="block text-[12px] font-medium text-white/70 mb-1.5">الصلاحية</label>
+            <select
+              value={role}
+              onChange={(e) => setRole(e.target.value)}
+              className="w-full h-11 px-3.5 bg-white/[0.03] border border-white/10 rounded-xl text-[14px] focus:outline-none focus:border-emerald-500/50"
+            >
+              <option value="moderator">مشرف (إدارة الطلبات فقط)</option>
+              <option value="super_admin">مدير عام (صلاحيات كاملة)</option>
+            </select>
+          </div>
+
+          <div className="bg-white/5 rounded-xl p-3 text-[11px] text-white/50">
+            <strong className="text-white/70">ملاحظات الصلاحيات:</strong>
+            <ul className="mt-1 space-y-1 mr-4 list-disc">
+              <li>المشرف: يستطيع رؤية الإحصائيات والطلبات فقط</li>
+              <li>المدير العام: كل الصلاحيات بما في ذلك إدارة المنتجات والمشرفين</li>
+            </ul>
+          </div>
+
+          <div className="flex gap-2 pt-4">
+            <button
+              type="button"
+              onClick={onClose}
+              className="flex-1 h-11 bg-white/5 hover:bg-white/10 text-white text-[14px] font-medium rounded-xl transition-all"
+            >
+              إلغاء
+            </button>
+            <button
+              type="submit"
+              disabled={loading}
+              className="flex-1 h-11 bg-white text-black text-[14px] font-bold rounded-xl hover:bg-white/90 transition-all disabled:opacity-50"
+            >
+              {loading ? 'جارٍ...' : 'إضافة المشرف'}
+            </button>
+          </div>
+        </form>
+      </motion.div>
+    </motion.div>
   );
 }
 
